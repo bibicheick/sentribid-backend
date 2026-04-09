@@ -4,12 +4,12 @@ from dotenv import load_dotenv
 load_dotenv()
 
 import os, sys, logging, secrets
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from .routers import bids
-from .auth import create_access_token
+from .auth import create_access_token, require_auth
 from .db import engine, Base, SessionLocal
 from . import models
 
@@ -144,6 +144,25 @@ def register(payload: RegisterIn):
         db.rollback()
         logger.error(f"Registration error: {e}")
         raise HTTPException(500, f"Registration failed: {str(e)}")
+    finally:
+        db.close()
+
+
+# ─── Auth: Current User Info ──────────────────────────────
+@app.get("/auth/me")
+def get_current_user(user_sub: str = Depends(require_auth)):
+    db = SessionLocal()
+    try:
+        user = db.query(models.User).filter(models.User.email == user_sub).first()
+        if not user:
+            return {"email": user_sub, "full_name": user_sub, "company_name": ""}
+        return {
+            "id": user.id,
+            "email": user.email,
+            "full_name": user.full_name or user.email,
+            "company_name": user.company_name or "",
+            "role": user.role,
+        }
     finally:
         db.close()
 

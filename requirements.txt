@@ -17,3 +17,4 @@ openai>=1.50.0
 google-generativeai>=0.8.0
 pdfplumber>=0.11.0
 psycopg2-binary>=2.9.9
+openpyxl>=3.1.0

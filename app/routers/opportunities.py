@@ -41,10 +41,10 @@ def _extract_text(filepath: str, file_type: str) -> str:
             try:
                 import pdfplumber
                 with pdfplumber.open(filepath) as pdf:
-                    for i, page in enumerate(pdf.pages[:30]):
+                    for i, page in enumerate(pdf.pages[:50]):
                         page_text = page.extract_text() or ""
                         text += page_text + "\n"
-                        if len(text) > 8000:
+                        if len(text) > 15000:
                             break
             except Exception as e:
                 logger.warning(f"PDF extraction failed: {e}")
@@ -54,16 +54,63 @@ def _extract_text(filepath: str, file_type: str) -> str:
                 doc = DocxDocument(filepath)
                 for para in doc.paragraphs:
                     text += para.text + "\n"
-                    if len(text) > 8000:
+                    if len(text) > 15000:
+                        break
+                # Also extract tables from DOCX
+                for table in doc.tables[:20]:
+                    for row in table.rows:
+                        row_text = " | ".join(cell.text.strip() for cell in row.cells if cell.text.strip())
+                        if row_text:
+                            text += row_text + "\n"
+                    if len(text) > 15000:
                         break
             except Exception as e:
                 logger.warning(f"DOCX extraction failed: {e}")
-        elif file_type in ("txt", "csv", "rtf"):
+        elif file_type in ("xlsx", "xls"):
+            try:
+                import openpyxl
+                wb = openpyxl.load_workbook(filepath, read_only=True, data_only=True)
+                for sheet_name in wb.sheetnames[:10]:
+                    ws = wb[sheet_name]
+                    text += f"\n--- Sheet: {sheet_name} ---\n"
+                    row_count = 0
+                    for row in ws.iter_rows(values_only=True):
+                        cells = [str(c).strip() if c is not None else "" for c in row]
+                        if any(cells):
+                            text += " | ".join(cells) + "\n"
+                            row_count += 1
+                        if row_count > 500 or len(text) > 15000:
+                            break
+                    if len(text) > 15000:
+                        break
+                wb.close()
+            except Exception as e:
+                logger.warning(f"Excel extraction failed: {e}")
+                # Fallback: try csv-style read
+                try:
+                    with open(filepath, "r", encoding="utf-8", errors="replace") as f:
+                        text = f.read(15000)
+                except Exception:
+                    pass
+        elif file_type == "csv":
+            try:
+                import csv
+                with open(filepath, "r", encoding="utf-8", errors="replace") as f:
+                    reader = csv.reader(f)
+                    for i, row in enumerate(reader):
+                        text += " | ".join(row) + "\n"
+                        if i > 500 or len(text) > 15000:
+                            break
+            except Exception as e:
+                logger.warning(f"CSV extraction failed: {e}")
+                with open(filepath, "r", encoding="utf-8", errors="replace") as f:
+                    text = f.read(15000)
+        elif file_type in ("txt", "rtf"):
             with open(filepath, "r", encoding="utf-8", errors="replace") as f:
-                text = f.read(8000)
+                text = f.read(15000)
     except Exception as e:
         logger.warning(f"Text extraction failed: {e}")
-    return text[:8000]
+    return text[:15000]
 
 
 def _get_attachments_text(opp) -> str:
@@ -72,7 +119,7 @@ def _get_attachments_text(opp) -> str:
         if att.extracted_text:
             parts.append(f"[{att.filename}]\n{att.extracted_text}")
     combined = "\n\n".join(parts)
-    return combined[:12000]
+    return combined[:25000]
 
 
 def _call_openai(system: str, user: str, json_mode: bool = True):
@@ -286,35 +333,42 @@ def delete_opportunity(opp_id: int, user: str = Depends(require_auth), db: Sessi
 
 @router.post("/{opp_id}/attachments")
 async def upload_attachment(
-    opp_id: int, file: UploadFile = File(...), category: str = Form("solicitation"),
+    opp_id: int, files: List[UploadFile] = File(...), category: str = Form("solicitation"),
     user: str = Depends(require_auth), db: Session = Depends(get_db),
 ):
     opp = db.query(models.Opportunity).filter(models.Opportunity.id == opp_id).first()
     if not opp:
         raise HTTPException(404, "Opportunity not found")
-    ext = (file.filename or "").rsplit(".", 1)[-1].lower()
-    if ext not in ALLOWED_EXTENSIONS:
-        raise HTTPException(400, f"File type .{ext} not allowed")
-    content = await file.read()
-    if len(content) > MAX_FILE_SIZE:
-        raise HTTPException(400, "File exceeds 20MB limit")
+
     upload_dir = os.path.join(UPLOAD_DIR, str(opp_id))
     os.makedirs(upload_dir, exist_ok=True)
-    safe_name = f"{uuid.uuid4().hex[:8]}_{file.filename}"
-    filepath = os.path.join(upload_dir, safe_name)
-    with open(filepath, "wb") as f:
-        f.write(content)
-    extracted = _extract_text(filepath, ext)
-    att = models.OpportunityAttachment(
-        opportunity_id=opp_id, filename=file.filename, stored_path=filepath,
-        file_type=ext, file_size=len(content), category=category,
-        extracted_text=extracted if extracted.strip() else None,
-    )
-    db.add(att)
-    db.commit()
-    db.refresh(att)
-    return {"id": att.id, "filename": att.filename, "file_type": att.file_type,
-            "file_size": att.file_size, "has_extracted_text": bool(att.extracted_text)}
+
+    results = []
+    for file in files:
+        ext = (file.filename or "").rsplit(".", 1)[-1].lower()
+        if ext not in ALLOWED_EXTENSIONS:
+            continue
+        content = await file.read()
+        if len(content) > MAX_FILE_SIZE:
+            continue
+        safe_name = f"{uuid.uuid4().hex[:8]}_{file.filename}"
+        filepath = os.path.join(upload_dir, safe_name)
+        with open(filepath, "wb") as f:
+            f.write(content)
+        extracted = _extract_text(filepath, ext)
+        att = models.OpportunityAttachment(
+            opportunity_id=opp_id, filename=file.filename, stored_path=filepath,
+            file_type=ext, file_size=len(content), category=category,
+            extracted_text=extracted if extracted.strip() else None,
+            original_filename=file.filename,
+        )
+        db.add(att)
+        db.commit()
+        db.refresh(att)
+        results.append({"id": att.id, "filename": att.filename, "file_type": att.file_type,
+                        "file_size": att.file_size, "has_extracted_text": bool(att.extracted_text)})
+
+    return {"files": results, "count": len(results)}
 
 
 @router.get("/{opp_id}/attachments")
@@ -706,38 +760,62 @@ Each section should be 2-4 paragraphs. Use the company's real name "{company_nam
 
 @router.post("/upload-and-analyze")
 async def upload_and_analyze(
-    file: UploadFile = File(...), title: str = Form(""), agency_name: str = Form("Unknown Agency"),
+    files: List[UploadFile] = File(...), title: str = Form(""), agency_name: str = Form("Unknown Agency"),
     source_url: str = Form(""), user: str = Depends(require_auth), db: Session = Depends(get_db),
 ):
-    ext = (file.filename or "").rsplit(".", 1)[-1].lower()
-    if ext not in ALLOWED_EXTENSIONS:
-        raise HTTPException(400, f"File type .{ext} not allowed")
-    content = await file.read()
-    if len(content) > MAX_FILE_SIZE:
-        raise HTTPException(400, "File exceeds 20MB limit")
+    if not files:
+        raise HTTPException(400, "No files provided")
+
+    # Use first file's name as default title
+    first_file = files[0]
     opp = models.Opportunity(
-        opp_code=_gen_opp_code(), title=title or file.filename or "Uploaded Solicitation",
+        opp_code=_gen_opp_code(),
+        title=title or (first_file.filename or "Uploaded Solicitation").rsplit(".", 1)[0],
         agency_name=agency_name, source_type="upload", source_url=source_url or None, status="new",
     )
     db.add(opp)
     db.flush()
+
     upload_dir = os.path.join(UPLOAD_DIR, str(opp.id))
     os.makedirs(upload_dir, exist_ok=True)
-    safe_name = f"{uuid.uuid4().hex[:8]}_{file.filename}"
-    filepath = os.path.join(upload_dir, safe_name)
-    with open(filepath, "wb") as f:
-        f.write(content)
-    extracted = _extract_text(filepath, ext)
-    att = models.OpportunityAttachment(
-        opportunity_id=opp.id, filename=file.filename, stored_path=filepath,
-        file_type=ext, file_size=len(content), category="solicitation",
-        extracted_text=extracted if extracted.strip() else None,
-    )
-    db.add(att)
+
+    all_text = []
+    file_count = 0
+
+    for file in files:
+        ext = (file.filename or "").rsplit(".", 1)[-1].lower()
+        if ext not in ALLOWED_EXTENSIONS:
+            continue
+        content = await file.read()
+        if len(content) > MAX_FILE_SIZE:
+            continue
+
+        safe_name = f"{uuid.uuid4().hex[:8]}_{file.filename}"
+        filepath = os.path.join(upload_dir, safe_name)
+        with open(filepath, "wb") as f:
+            f.write(content)
+
+        extracted = _extract_text(filepath, ext)
+        att = models.OpportunityAttachment(
+            opportunity_id=opp.id, filename=file.filename, stored_path=filepath,
+            file_type=ext, file_size=len(content), category="solicitation",
+            extracted_text=extracted if extracted.strip() else None,
+            original_filename=file.filename,
+        )
+        db.add(att)
+        file_count += 1
+        if extracted.strip():
+            all_text.append(f"[{file.filename}]\n{extracted}")
+
     db.commit()
     db.refresh(opp)
-    return {"ok": True, "opp_id": opp.id, "opp_code": opp.opp_code, "title": opp.title,
-            "has_text": bool(extracted.strip()), "message": "Solicitation uploaded. Click Analyze to run AI analysis."}
+
+    return {
+        "ok": True, "opp_id": opp.id, "opp_code": opp.opp_code, "title": opp.title,
+        "files_uploaded": file_count,
+        "has_text": bool(all_text),
+        "message": f"{file_count} file(s) uploaded. Click Analyze to run AI analysis.",
+    }
 
 
 # ─── BID AUTOPILOT v0.7.0 ────────────────────────────────
@@ -745,7 +823,7 @@ async def upload_and_analyze(
 
 @router.post("/autopilot-upload")
 async def autopilot_upload(
-    file: UploadFile = File(...),
+    files: List[UploadFile] = File(...),
     title: str = Form(""),
     agency_name: str = Form("Unknown Agency"),
     format_type: str = Form("pdf"),
@@ -753,27 +831,25 @@ async def autopilot_upload(
     db: Session = Depends(get_db),
 ):
     """
-    BID AUTOPILOT — Upload an RFP and get a complete submission package in one call.
+    BID AUTOPILOT — Upload RFP file(s) and get a complete submission package in one call.
+    Accepts multiple files (PDF, DOCX, XLSX, CSV, TXT).
 
     Pipeline: Upload → Extract → AI Analysis → Shred RFP → Compliance Matrix →
               War Room → Convert to Bid → Generate Proposal (PDF/DOCX)
 
     Returns all analysis results + a downloadable proposal file.
     """
+    if not files:
+        raise HTTPException(400, "No files provided")
+
     steps_completed = []
     errors = []
 
-    # ── Step 1: Upload & Extract ──────────────────────────
-    ext = (file.filename or "").rsplit(".", 1)[-1].lower()
-    if ext not in ALLOWED_EXTENSIONS:
-        raise HTTPException(400, f"File type .{ext} not allowed")
-    content = await file.read()
-    if len(content) > MAX_FILE_SIZE:
-        raise HTTPException(400, "File exceeds 20MB limit")
-
+    # ── Step 1: Upload & Extract ALL files ────────────────
+    first_file = files[0]
     opp = models.Opportunity(
         opp_code=_gen_opp_code(),
-        title=title or (file.filename or "Uploaded RFP").rsplit(".", 1)[0],
+        title=title or (first_file.filename or "Uploaded RFP").rsplit(".", 1)[0],
         agency_name=agency_name,
         source_type="upload",
         status="new",
@@ -783,24 +859,44 @@ async def autopilot_upload(
 
     upload_dir = os.path.join(UPLOAD_DIR, str(opp.id))
     os.makedirs(upload_dir, exist_ok=True)
-    safe_name = f"{uuid.uuid4().hex[:8]}_{file.filename}"
-    filepath = os.path.join(upload_dir, safe_name)
-    with open(filepath, "wb") as f:
-        f.write(content)
 
-    extracted = _extract_text(filepath, ext)
-    att = models.OpportunityAttachment(
-        opportunity_id=opp.id, filename=file.filename, stored_path=filepath,
-        file_type=ext, file_size=len(content), category="solicitation",
-        extracted_text=extracted if extracted.strip() else None,
-    )
-    db.add(att)
+    all_extracted = []
+    file_count = 0
+
+    for file in files:
+        ext = (file.filename or "").rsplit(".", 1)[-1].lower()
+        if ext not in ALLOWED_EXTENSIONS:
+            errors.append(f"Skipped {file.filename} — unsupported type .{ext}")
+            continue
+        content = await file.read()
+        if len(content) > MAX_FILE_SIZE:
+            errors.append(f"Skipped {file.filename} — exceeds 20MB limit")
+            continue
+
+        safe_name = f"{uuid.uuid4().hex[:8]}_{file.filename}"
+        filepath = os.path.join(upload_dir, safe_name)
+        with open(filepath, "wb") as f_out:
+            f_out.write(content)
+
+        extracted = _extract_text(filepath, ext)
+        att = models.OpportunityAttachment(
+            opportunity_id=opp.id, filename=file.filename, stored_path=filepath,
+            file_type=ext, file_size=len(content), category="solicitation",
+            extracted_text=extracted if extracted.strip() else None,
+            original_filename=file.filename,
+        )
+        db.add(att)
+        file_count += 1
+        if extracted.strip():
+            all_extracted.append(f"[{file.filename}]\n{extracted}")
+
     db.commit()
     db.refresh(opp)
     steps_completed.append("upload")
 
-    if not extracted.strip():
-        raise HTTPException(400, "Could not extract text from the uploaded file. Try a text-based PDF or DOCX.")
+    combined_text = "\n\n".join(all_extracted)
+    if not combined_text.strip():
+        raise HTTPException(400, f"Could not extract text from {file_count} file(s). Try text-based PDFs or DOCX files.")
 
     # Get profile context
     profile_text = _get_business_profile(db, user)
@@ -811,7 +907,7 @@ async def autopilot_upload(
     company_name = u.profile.company_name if (u and u.profile and u.profile.company_name) else "Your Company"
     profile_obj = u.profile if u else None
 
-    attachments_text = extracted[:12000]
+    attachments_text = combined_text[:25000]
     context = _build_opp_context(opp, attachments_text)
     if profile_text:
         context += f"\n\n--- Your Business Profile ---\n{profile_text}"
@@ -872,7 +968,7 @@ async def autopilot_upload(
     shredded = {}
     try:
         from ..compliance_engine import shred_rfp
-        shredded = shred_rfp(extracted, opportunity_title=opp.title)
+        shredded = shred_rfp(combined_text, opportunity_title=opp.title)
         if not shredded.get("error"):
             if hasattr(opp, 'shredded_rfp'):
                 opp.shredded_rfp = json.dumps(shredded)
@@ -910,7 +1006,7 @@ async def autopilot_upload(
         from ..sam_connector import search_awards
 
         opp_context = f"Title: {opp.title}\nAgency: {opp.agency_name}\nNAICS: {opp.naics_code}\nDue: {opp.due_date}\n"
-        opp_context += f"\nDocument:\n{extracted[:3000]}"
+        opp_context += f"\nDocument:\n{combined_text[:3000]}"
 
         historical = []
         search_term = opp.naics_code or (opp.title.split()[0] if opp.title else "")
